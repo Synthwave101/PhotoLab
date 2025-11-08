@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import os
 import sys
+import json
 import shutil
 import subprocess
+import urllib.error
+import urllib.request
 from math import gcd
 from copy import deepcopy
 from datetime import datetime
@@ -68,6 +71,10 @@ from preset_storage import CropPreset, PresetStorage
 
 
 _DROP_VALUE = object()
+
+GITHUB_OWNER = "Synthwave101"
+GITHUB_REPO = "PhotoLab"
+GITHUB_BRANCH = "main"
 
 
 class FileListItem(QTreeWidgetItem):
@@ -1286,91 +1293,179 @@ class PhotoLabWindow(QMainWindow):
         self._crop_auto_sync = False
         self._update_ratio_selection_from_dimensions()
 
-    def check_for_updates(self) -> None:
+    def _get_app_support_dir(self) -> Path:
+        if sys.platform == "darwin":
+            base = Path.home() / "Library" / "Application Support"
+        elif sys.platform.startswith("win"):
+            base_env = os.environ.get("APPDATA")
+            base = Path(base_env) if base_env else Path.home() / "AppData" / "Roaming"
+        else:
+            base_env = os.environ.get("XDG_DATA_HOME")
+            base = Path(base_env) if base_env else Path.home() / ".local" / "share"
+        data_dir = base / "PhotoLab"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        return data_dir
+
+    def _resolve_current_version(self, version_file: Path) -> Optional[str]:
+        try:
+            if version_file.exists():
+                stored = version_file.read_text(encoding="utf-8").strip()
+                if stored:
+                    return stored
+        except OSError:
+            pass
+
         repo_root = Path(__file__).resolve().parent.parent
         git_executable = shutil.which("git")
-        changes_detected = True
-        if git_executable is not None:
+        if git_executable and (repo_root / ".git").exists():
             try:
                 result = subprocess.run(
-                    [git_executable, "status", "--porcelain"],
+                    [git_executable, "rev-parse", "HEAD"],
+                    cwd=repo_root,
                     capture_output=True,
                     text=True,
-                    cwd=repo_root,
                     check=True,
                 )
-                changes_detected = bool(result.stdout.strip())
             except subprocess.CalledProcessError:
-                changes_detected = True
+                return None
+            sha = result.stdout.strip()
+            return sha or None
+        return None
 
-        if not changes_detected:
+    def _locate_python_executable(self) -> Optional[str]:
+        candidate = Path(sys.executable)
+        if candidate.exists():
+            return str(candidate)
+        for name in ("python3", "python"):
+            located = shutil.which(name)
+            if located:
+                return located
+        return None
+
+    def _fetch_remote_commit_sha(self, owner: str, repo: str, branch: str) -> str:
+        api_url = f"https://api.github.com/repos/{owner}/{repo}/commits/{branch}"
+        request = urllib.request.Request(api_url, headers={"User-Agent": "PhotoLab-Updater"})
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:
+                payload = response.read()
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"GitHub respondió con {exc.code}: {exc.reason}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"No se pudo contactar GitHub: {exc.reason}") from exc
+
+        try:
+            data = json.loads(payload.decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("No se pudo interpretar la respuesta de GitHub") from exc
+
+        sha = data.get("sha") if isinstance(data, dict) else None
+        if not isinstance(sha, str) or not sha:
+            raise RuntimeError("No se encontró la versión remota en GitHub")
+        return sha
+
+    def _run_command(self, command: List[str], cwd: Optional[Path] = None) -> subprocess.CompletedProcess:
+        result = subprocess.run(command, cwd=cwd, capture_output=True, text=True)
+        if result.returncode != 0:
+            stdout = result.stdout.strip()
+            stderr = result.stderr.strip()
+            detail = stderr or stdout or "Error desconocido"
+            cmd_display = " ".join(command)
+            raise RuntimeError(f"{detail}\nComando: {cmd_display}")
+        return result
+
+    def check_for_updates(self) -> None:
+        owner = GITHUB_OWNER
+        repo = GITHUB_REPO
+        branch = GITHUB_BRANCH
+
+        data_dir = self._get_app_support_dir()
+        version_file = data_dir / "current_version.txt"
+        update_dir = data_dir / "updater"
+
+        try:
+            remote_sha = self._fetch_remote_commit_sha(owner, repo, branch)
+        except RuntimeError as exc:
+            self.show_error(str(exc))
+            return
+
+        current_sha = self._resolve_current_version(version_file)
+        if current_sha == remote_sha:
             QMessageBox.information(
                 self,
                 "Actualización",
-                "No se detectaron cambios pendientes.",
+                "Ya estás usando la última versión publicada en GitHub.",
             )
             return
 
         confirm = QMessageBox.question(
             self,
-            "Reconstruir aplicación",
-            "Se generará nuevamente el paquete .app utilizando py2app. ¿Deseas continuar?",
+            "Actualizar aplicación",
+            "Se descargará la última versión desde GitHub y se recompilará la aplicación. ¿Deseas continuar?",
         )
         if confirm != QMessageBox.StandardButton.Yes:
             return
 
-        python_executable = Path(sys.executable)
-        venv_python = repo_root / "venv" / "bin" / "python"
-        if venv_python.exists():
-            python_executable = venv_python
+        git_executable = shutil.which("git")
+        if git_executable is None:
+            self.show_error("No se encontró el comando 'git' para descargar la actualización.")
+            return
+
+        python_executable = self._locate_python_executable()
+        if python_executable is None:
+            self.show_error("No se encontró un intérprete de Python para compilar la aplicación.")
+            return
 
         self.update_app_button.setEnabled(False)
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
 
-        packaging_check = subprocess.run(
-            [str(python_executable), "-c", "import packaging"],
-            capture_output=True,
-            text=True,
-        )
-        if packaging_check.returncode != 0:
-            install_cmd = [str(python_executable), "-m", "pip", "install", "packaging>=23.0", "py2app>=0.28"]
-            install_result = subprocess.run(
-                install_cmd,
-                cwd=repo_root,
-                capture_output=True,
-                text=True,
-            )
-            if install_result.returncode != 0:
-                QApplication.restoreOverrideCursor()
-                self.update_app_button.setEnabled(True)
-                message = install_result.stderr.strip() or install_result.stdout.strip() or "No se pudo instalar packaging"
-                self.show_error(f"Fallo al preparar el entorno de compilación:\n{message[:1000]}")
-                return
-
+        error_message: Optional[str] = None
         try:
-            build_result = subprocess.run(
-                [str(python_executable), "setup.py", "py2app"],
-                cwd=repo_root,
-                capture_output=True,
-                text=True,
+            git_dir = update_dir / ".git"
+            if not git_dir.exists():
+                if update_dir.exists():
+                    shutil.rmtree(update_dir, ignore_errors=True)
+                update_dir.parent.mkdir(parents=True, exist_ok=True)
+                self._run_command(
+                    [git_executable, "clone", f"https://github.com/{owner}/{repo}.git", str(update_dir)]
+                )
+            else:
+                self._run_command([git_executable, "fetch", "origin"], cwd=update_dir)
+            self._run_command([git_executable, "checkout", branch], cwd=update_dir)
+            self._run_command([git_executable, "reset", "--hard", f"origin/{branch}"], cwd=update_dir)
+
+            requirements_path = update_dir / "requirements.txt"
+            if requirements_path.exists():
+                self._run_command(
+                    [python_executable, "-m", "pip", "install", "-r", str(requirements_path)],
+                    cwd=update_dir,
+                )
+
+            self._run_command(
+                [python_executable, "-m", "pip", "install", "packaging>=23.0", "py2app>=0.28"],
+                cwd=update_dir,
             )
+
+            self._run_command([python_executable, "setup.py", "py2app"], cwd=update_dir)
+        except RuntimeError as exc:
+            error_message = str(exc)
         except Exception as exc:  # noqa: BLE001
+            error_message = str(exc)
+        finally:
             QApplication.restoreOverrideCursor()
             self.update_app_button.setEnabled(True)
-            self.show_error(f"No se pudo ejecutar py2app: {exc}")
+
+        if error_message:
+            self.show_error(f"No se pudo completar la actualización:\n{error_message[:1000]}")
             return
 
-        QApplication.restoreOverrideCursor()
-        self.update_app_button.setEnabled(True)
+        try:
+            version_file.write_text(remote_sha, encoding="utf-8")
+        except OSError:
+            pass
 
-        if build_result.returncode != 0:
-            message = build_result.stderr.strip() or build_result.stdout.strip() or "Error desconocido"
-            self.show_error(f"La compilación falló:\n{message[:1000]}")
-            return
+        self.status_label.setText("Actualización descargada. Iniciando nueva versión...")
 
-        self.status_label.setText("Compilación completada. Iniciando versión empaquetada...")
-
-        app_bundle = repo_root / "dist" / "PhotoLab.app"
+        app_bundle = update_dir / "dist" / "PhotoLab.app"
         if app_bundle.exists():
             try:
                 subprocess.Popen(["open", str(app_bundle)])
@@ -1387,7 +1482,7 @@ class PhotoLabWindow(QMainWindow):
         QMessageBox.information(
             self,
             "Actualización",
-            "Compilación finalizada. Ejecuta la app desde la carpeta dist/",
+            f"Compilación finalizada. Ejecuta PhotoLab.app desde {update_dir / 'dist'}",
         )
 
     def _set_crop_mode(self, mode: str) -> None:
