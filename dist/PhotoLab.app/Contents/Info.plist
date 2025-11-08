@@ -9,7 +9,7 @@
 	<key>CFBundleExecutable</key>
 	<string>PhotoLab</string>
 	<key>CFBundleIconFile</key>
-	<string>PhotoLab.icns</string>
+	<string>PythonApplet.icns</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.example.photolab</string>
 	<key>CFBundleInfoDictionaryVersion</key>
