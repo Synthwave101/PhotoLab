@@ -1,4 +1,4 @@
-# Metadata Shifter
+# Photo Lab
 
 Aplicación de escritorio para macOS (y otros sistemas compatibles con PyQt6) que permite:
 
