@@ -1379,29 +1379,50 @@ class PhotoLabWindow(QMainWindow):
             raise RuntimeError(f"{detail}\nComando: {cmd_display}")
         return result
 
-    def _ensure_pip(self, python_executable: str, work_dir: Path) -> None:
-        try:
-            self._run_command([python_executable, "-m", "pip", "--version"], cwd=work_dir)
-            return
-        except RuntimeError as exc:
-            if "No module named pip" not in str(exc):
-                raise
-
-        ensure_candidates = [
-            [python_executable, "-m", "ensurepip", "--upgrade"],
-            [python_executable, "-m", "ensurepip", "--default-pip"],
+    @staticmethod
+    def _find_venv_python(venv_dir: Path) -> Optional[Path]:
+        scripts_dir = venv_dir / ("Scripts" if os.name == "nt" else "bin")
+        candidates = [
+            "python.exe",
+            "python3.exe",
+            "python",
+            "python3",
         ]
-        last_error: Optional[Exception] = None
-        for command in ensure_candidates:
-            try:
-                self._run_command(command, cwd=work_dir)
-                break
-            except RuntimeError as exc:  # noqa: PERF203 - break after first success
-                last_error = exc
-        else:
-            raise RuntimeError("No se pudo inicializar pip en el intérprete embebido") from last_error
+        for name in candidates:
+            candidate = scripts_dir / name
+            if candidate.exists():
+                return candidate
+        return None
 
-        self._run_command([python_executable, "-m", "pip", "install", "--upgrade", "pip"], cwd=work_dir)
+    def _ensure_virtualenv(self, python_executable: str, work_dir: Path) -> str:
+        venv_dir = work_dir / ".venv"
+
+        def create_venv() -> None:
+            if venv_dir.exists():
+                shutil.rmtree(venv_dir, ignore_errors=True)
+            command = [python_executable, "-m", "venv"]
+            if sys.version_info >= (3, 10):
+                command.append("--upgrade-deps")
+            command.append(str(venv_dir))
+            self._run_command(command, cwd=work_dir)
+
+        venv_python = self._find_venv_python(venv_dir)
+        if venv_python is None:
+            create_venv()
+            venv_python = self._find_venv_python(venv_dir)
+        if venv_python is None:
+            raise RuntimeError("No se pudo preparar el entorno virtual de actualización")
+
+        try:
+            self._run_command([str(venv_python), "-m", "pip", "--version"], cwd=work_dir)
+        except RuntimeError:
+            create_venv()
+            venv_python = self._find_venv_python(venv_dir)
+            if venv_python is None:
+                raise RuntimeError("No se pudo preparar el entorno virtual de actualización")
+            self._run_command([str(venv_python), "-m", "pip", "--version"], cwd=work_dir)
+
+        return str(venv_python)
 
     def check_for_updates(self) -> None:
         owner = GITHUB_OWNER
@@ -1450,7 +1471,7 @@ class PhotoLabWindow(QMainWindow):
             self.update_app_action.setEnabled(False)
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
 
-        total_steps = 5
+        total_steps = 6
         progress_dialog = QProgressDialog(
             "Preparando actualización...",
             None,
@@ -1493,24 +1514,27 @@ class PhotoLabWindow(QMainWindow):
             self._run_command([git_executable, "reset", "--hard", f"origin/{branch}"], cwd=update_dir)
 
             advance("Preparando entorno de Python...")
-            self._ensure_pip(python_executable, update_dir)
+            venv_python = self._ensure_virtualenv(python_executable, update_dir)
 
             requirements_path = update_dir / "requirements.txt"
+            advance("Actualizando pip...")
+            self._run_command([venv_python, "-m", "pip", "install", "--upgrade", "pip"], cwd=update_dir)
+
             advance("Instalando dependencias del proyecto...")
             if requirements_path.exists():
                 self._run_command(
-                    [python_executable, "-m", "pip", "install", "-r", str(requirements_path)],
+                    [venv_python, "-m", "pip", "install", "-r", str(requirements_path)],
                     cwd=update_dir,
                 )
 
             advance("Instalando herramientas de compilación...")
             self._run_command(
-                [python_executable, "-m", "pip", "install", "packaging>=23.0", "py2app>=0.28"],
+                [venv_python, "-m", "pip", "install", "packaging>=23.0", "py2app>=0.28"],
                 cwd=update_dir,
             )
 
             advance("Compilando aplicación...")
-            self._run_command([python_executable, "setup.py", "py2app"], cwd=update_dir)
+            self._run_command([venv_python, "setup.py", "py2app"], cwd=update_dir)
             progress_dialog.setLabelText("Actualización completada")
             progress_dialog.setValue(total_steps)
         except RuntimeError as exc:
