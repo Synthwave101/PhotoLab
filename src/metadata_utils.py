@@ -266,9 +266,33 @@ def save_image_with_metadata(
 
     if normalized_format == "PNG" and PngInfo is not None:
         png_info = PngInfo()
+        has_text_entries = False
         for key, value in info.items():
+            lower_key = key.lower()
+            if lower_key in {"icc_profile", "transparency"}:
+                payload = value
+                if isinstance(payload, str):
+                    try:
+                        payload = bytes.fromhex(payload)
+                    except ValueError:
+                        continue
+                save_kwargs[lower_key] = payload
+                continue
+            if isinstance(value, (tuple, list, int, float)):
+                save_kwargs[key] = value
+                continue
+            if isinstance(value, bytes):
+                try:
+                    text_value = value.decode("utf-8")
+                except UnicodeDecodeError:
+                    continue
+                png_info.add_text(key, text_value)
+                has_text_entries = True
+                continue
             png_info.add_text(key, value_to_display(value))
-        save_kwargs["pnginfo"] = png_info
+            has_text_entries = True
+        if has_text_entries:
+            save_kwargs["pnginfo"] = png_info
     elif normalized_format in {"JPEG", "JPG"}:
         save_kwargs.setdefault("quality", 95)
 
