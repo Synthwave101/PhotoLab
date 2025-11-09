@@ -55,6 +55,7 @@ from PyQt6.QtWidgets import (
     QListWidgetItem,
     QVBoxLayout,
     QWidget,
+    QProgressDialog,
 )
 
 from metadata_utils import (
@@ -111,6 +112,11 @@ class PhotoLabWindow(QMainWindow):
         self.setCentralWidget(self.central)
         self.layout = QVBoxLayout()
         self.central.setLayout(self.layout)
+
+        menu_bar = self.menuBar()
+        tools_menu = menu_bar.addMenu("Herramientas")
+        self.update_app_action = tools_menu.addAction("Actualizar aplicación…")
+        self.update_app_action.triggered.connect(self.check_for_updates)
 
         self.metadata_table: Optional[QTableWidget] = None
 
@@ -1373,6 +1379,30 @@ class PhotoLabWindow(QMainWindow):
             raise RuntimeError(f"{detail}\nComando: {cmd_display}")
         return result
 
+    def _ensure_pip(self, python_executable: str, work_dir: Path) -> None:
+        try:
+            self._run_command([python_executable, "-m", "pip", "--version"], cwd=work_dir)
+            return
+        except RuntimeError as exc:
+            if "No module named pip" not in str(exc):
+                raise
+
+        ensure_candidates = [
+            [python_executable, "-m", "ensurepip", "--upgrade"],
+            [python_executable, "-m", "ensurepip", "--default-pip"],
+        ]
+        last_error: Optional[Exception] = None
+        for command in ensure_candidates:
+            try:
+                self._run_command(command, cwd=work_dir)
+                break
+            except RuntimeError as exc:  # noqa: PERF203 - break after first success
+                last_error = exc
+        else:
+            raise RuntimeError("No se pudo inicializar pip en el intérprete embebido") from last_error
+
+        self._run_command([python_executable, "-m", "pip", "install", "--upgrade", "pip"], cwd=work_dir)
+
     def check_for_updates(self) -> None:
         owner = GITHUB_OWNER
         repo = GITHUB_REPO
@@ -1416,10 +1446,39 @@ class PhotoLabWindow(QMainWindow):
             return
 
         self.update_app_button.setEnabled(False)
+        if hasattr(self, "update_app_action"):
+            self.update_app_action.setEnabled(False)
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+
+        total_steps = 5
+        progress_dialog = QProgressDialog(
+            "Preparando actualización...",
+            None,
+            0,
+            total_steps,
+            self,
+        )
+        progress_dialog.setWindowTitle("Actualizando PhotoLab")
+        progress_dialog.setCancelButton(None)
+        progress_dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progress_dialog.setAutoClose(True)
+        progress_dialog.setAutoReset(True)
+        progress_dialog.setValue(0)
+        progress_dialog.show()
+        QApplication.processEvents()
+
+        step_counter = 0
+
+        def advance(message: str) -> None:
+            nonlocal step_counter
+            step_counter += 1
+            progress_dialog.setLabelText(f"{message}\n({step_counter}/{total_steps})")
+            progress_dialog.setValue(step_counter)
+            QApplication.processEvents()
 
         error_message: Optional[str] = None
         try:
+            advance("Sincronizando repositorio...")
             git_dir = update_dir / ".git"
             if not git_dir.exists():
                 if update_dir.exists():
@@ -1433,19 +1492,27 @@ class PhotoLabWindow(QMainWindow):
             self._run_command([git_executable, "checkout", branch], cwd=update_dir)
             self._run_command([git_executable, "reset", "--hard", f"origin/{branch}"], cwd=update_dir)
 
+            advance("Preparando entorno de Python...")
+            self._ensure_pip(python_executable, update_dir)
+
             requirements_path = update_dir / "requirements.txt"
+            advance("Instalando dependencias del proyecto...")
             if requirements_path.exists():
                 self._run_command(
                     [python_executable, "-m", "pip", "install", "-r", str(requirements_path)],
                     cwd=update_dir,
                 )
 
+            advance("Instalando herramientas de compilación...")
             self._run_command(
                 [python_executable, "-m", "pip", "install", "packaging>=23.0", "py2app>=0.28"],
                 cwd=update_dir,
             )
 
+            advance("Compilando aplicación...")
             self._run_command([python_executable, "setup.py", "py2app"], cwd=update_dir)
+            progress_dialog.setLabelText("Actualización completada")
+            progress_dialog.setValue(total_steps)
         except RuntimeError as exc:
             error_message = str(exc)
         except Exception as exc:  # noqa: BLE001
@@ -1453,6 +1520,9 @@ class PhotoLabWindow(QMainWindow):
         finally:
             QApplication.restoreOverrideCursor()
             self.update_app_button.setEnabled(True)
+            if hasattr(self, "update_app_action"):
+                self.update_app_action.setEnabled(True)
+            progress_dialog.close()
 
         if error_message:
             self.show_error(f"No se pudo completar la actualización:\n{error_message[:1000]}")
